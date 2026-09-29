@@ -62,7 +62,7 @@ class Drone:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _recv_match(self, type, timeout: float):
+    def recv_match(self, type, timeout: float):
         """conn.recv_match, but a dead connection raises DroneError.
 
         A closed/reset TCP socket doesn't always raise cleanly -- pymavlink's
@@ -105,7 +105,7 @@ class Drone:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match("COMMAND_ACK", max(remaining, 0))
+            msg = self.recv_match("COMMAND_ACK", max(remaining, 0))
             if msg is None:
                 break
             if msg.command != command:
@@ -137,7 +137,7 @@ class Drone:
         last_status_print = 0.0
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match(["EKF_STATUS_REPORT", "STATUSTEXT"], max(remaining, 0))
+            msg = self.recv_match(["EKF_STATUS_REPORT", "STATUSTEXT"], max(remaining, 0))
             if msg is None:
                 break
             mtype = msg.get_type()
@@ -167,7 +167,7 @@ class Drone:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match("HEARTBEAT", max(remaining, 0))
+            msg = self.recv_match("HEARTBEAT", max(remaining, 0))
             if msg is None:
                 break
             if msg.custom_mode == custom_mode:
@@ -185,7 +185,7 @@ class Drone:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match("HEARTBEAT", max(remaining, 0))
+            msg = self.recv_match("HEARTBEAT", max(remaining, 0))
             if msg is None:
                 break
             if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
@@ -204,7 +204,7 @@ class Drone:
         last_print = 0.0
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match("GLOBAL_POSITION_INT", max(remaining, 0))
+            msg = self.recv_match("GLOBAL_POSITION_INT", max(remaining, 0))
             if msg is None:
                 break
             alt = msg.relative_alt / 1000.0
@@ -221,7 +221,7 @@ class Drone:
 
     def current_position(self, timeout: float = 5.0) -> tuple[float, float, float]:
         """Return the current (lat, lon, relative_alt_m) from telemetry."""
-        msg = self._recv_match("GLOBAL_POSITION_INT", timeout)
+        msg = self.recv_match("GLOBAL_POSITION_INT", timeout)
         if msg is None:
             raise DroneError("no GLOBAL_POSITION_INT received")
         return msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1000.0
@@ -280,7 +280,7 @@ class Drone:
                 self.goto(lat, lon, alt_m)
 
             remaining = deadline - time.monotonic()
-            msg = self._recv_match("GLOBAL_POSITION_INT", max(min(remaining, resend_interval), 0))
+            msg = self.recv_match("GLOBAL_POSITION_INT", max(min(remaining, resend_interval), 0))
             if msg is None:
                 continue
 
@@ -301,7 +301,7 @@ class Drone:
         last_print = 0.0
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            msg = self._recv_match(["HEARTBEAT", "GLOBAL_POSITION_INT"], max(remaining, 0))
+            msg = self.recv_match(["HEARTBEAT", "GLOBAL_POSITION_INT"], max(remaining, 0))
             if msg is None:
                 break
             if msg.get_type() == "GLOBAL_POSITION_INT":
@@ -313,3 +313,38 @@ class Drone:
                 if not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
                     return
         raise DroneError("RTL did not result in landing/disarm within timeout")
+
+    def set_param(self, name: str, value: float, timeout: float = 10.0) -> None:
+        """Set a parameter (vehicle or simulator) and confirm via PARAM_VALUE.
+
+        Used to inject the SIM_BATT_VOLTAGE failure for Part 3 -- the same
+        MAVLink parameter protocol used for any real vehicle parameter.
+        """
+        try:
+            self.conn.mav.param_set_send(
+                self.conn.target_system,
+                self.conn.target_component,
+                name.encode("ascii"),
+                float(value),
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+            )
+        except OSError as exc:
+            raise DroneError(f"lost connection to drone: {exc}") from exc
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            msg = self.recv_match("PARAM_VALUE", max(remaining, 0))
+            if msg is None:
+                break
+            param_id = msg.param_id
+            if isinstance(param_id, bytes):
+                param_id = param_id.decode("ascii", errors="replace")
+            if param_id.rstrip("\x00") != name:
+                continue
+            if abs(msg.param_value - value) < 1e-3:
+                return
+            raise DroneError(
+                f"param {name} confirmed as {msg.param_value}, expected {value}"
+            )
+        raise DroneError(f"timed out confirming param '{name}' was set")
